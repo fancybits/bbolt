@@ -215,6 +215,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	// Open data file and separate sync handler for metadata writes.
 	var err error
 	if db.file, err = db.openFile(path, flag|os.O_CREATE, mode); err != nil {
+		log.Printf("bolt.Open(): openfile error: %s", err)
 		_ = db.close()
 		return nil, err
 	}
