@@ -228,10 +228,12 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	// if !options.ReadOnly.
 	// The database file is locked using the shared lock (more than one process may
 	// hold a lock at the same time) otherwise (options.ReadOnly is set).
+	if !db.readOnly {
 	if err := flock(db, !db.readOnly, options.Timeout); err != nil {
 		log.Printf("bolt.Open(): flock error: %s", err)
 		_ = db.close()
 		return nil, err
+	}
 	}
 
 	// Default values for test hooks
