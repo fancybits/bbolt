@@ -227,7 +227,8 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	// if !options.ReadOnly.
 	// The database file is locked using the shared lock (more than one process may
 	// hold a lock at the same time) otherwise (options.ReadOnly is set).
-	if err := flock(db, !db.readOnly, options.Timeout); err != nil && !db.readOnly {
+	if err := flock(db, !db.readOnly, options.Timeout); err != nil {
+		log.Printf("bolt.Open(): flock error: %s", err)
 		_ = db.close()
 		return nil, err
 	}
@@ -242,6 +243,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 
 	// Initialize the database if it doesn't exist.
 	if info, err := db.file.Stat(); err != nil {
+		log.Printf("bolt.Open(): stat error: %s", err)
 		_ = db.close()
 		return nil, err
 	} else if info.Size() == 0 {
@@ -268,6 +270,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 				db.pageSize = int(m.pageSize)
 			}
 		} else {
+			log.Printf("bolt.Open(): readat error: %s", err)
 			_ = db.close()
 			return nil, ErrInvalid
 		}
@@ -282,6 +285,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 
 	// Memory map the data file.
 	if err := db.mmap(options.InitialMmapSize); err != nil {
+		log.Printf("bolt.Open(): mmap error: %s", err)
 		_ = db.close()
 		return nil, err
 	}
