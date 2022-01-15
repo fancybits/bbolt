@@ -250,6 +250,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	} else if info.Size() == 0 {
 		// Initialize new files with meta pages.
 		if err := db.init(); err != nil {
+			log.Printf("bolt.Open(): init error: %s", err)
 			// clean up file descriptor on initialization fail
 			_ = db.close()
 			return nil, err
