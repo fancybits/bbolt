@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"runtime"
 	"sort"
@@ -208,9 +207,8 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	// Open data file and separate sync handler for metadata writes.
 	var err error
 	if db.file, err = db.openFile(path, flag, mode); err != nil {
-		log.Printf("bolt.Open(): openfile error: %s", err)
 		_ = db.close()
-		return nil, err
+		return nil, fmt.Errorf("bolt.Open(): openfile error: %w", err)
 	}
 	db.path = db.file.Name()
 
@@ -223,9 +221,8 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	// hold a lock at the same time) otherwise (options.ReadOnly is set).
 	if !db.readOnly {
 		if err := flock(db, !db.readOnly, options.Timeout); err != nil {
-			log.Printf("bolt.Open(): flock error: %s", err)
 			_ = db.close()
-			return nil, err
+			return nil, fmt.Errorf("bolt.Open(): flock error: %w", err)
 		}
 	}
 
@@ -239,25 +236,22 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 
 	// Initialize the database if it doesn't exist.
 	if info, err := db.file.Stat(); err != nil {
-		log.Printf("bolt.Open(): stat error: %s", err)
 		_ = db.close()
-		return nil, err
+		return nil, fmt.Errorf("bolt.Open(): stat error: %w", err)
 	} else if info.Size() == 0 {
 		// Initialize new files with meta pages.
 		if err := db.init(); err != nil {
-			log.Printf("bolt.Open(): init error: %s", err)
 			// clean up file descriptor on initialization fail
 			_ = db.close()
-			return nil, err
+			return nil, fmt.Errorf("bolt.Open(): init error: %w", err)
 		}
 	} else {
 		// try to get the page size from the metadata pages
 		if pgSize, err := db.getPageSize(); err == nil {
 			db.pageSize = pgSize
 		} else {
-			log.Printf("bolt.Open(): readat error: %s", err)
 			_ = db.close()
-			return nil, berrors.ErrInvalid
+			return nil, fmt.Errorf("bolt.Open(): pagesize error: %w: %w", err, berrors.ErrInvalid)
 		}
 	}
 
@@ -270,9 +264,8 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 
 	// Memory map the data file.
 	if err := db.mmap(options.InitialMmapSize); err != nil {
-		log.Printf("bolt.Open(): mmap error: %s", err)
 		_ = db.close()
-		return nil, err
+		return nil, fmt.Errorf("bolt.Open(): mmap error: %w", err)
 	}
 
 	if db.PreLoadFreelist {

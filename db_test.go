@@ -138,7 +138,7 @@ func TestOpen_ErrInvalid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := bolt.Open(path, 0600, nil); err != berrors.ErrInvalid {
+	if _, err := bolt.Open(path, 0600, nil); !errors.Is(err, berrors.ErrInvalid) {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
