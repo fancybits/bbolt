@@ -8,6 +8,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"go.etcd.io/bbolt/errors"
 )
 
 // fdatasync flushes written data to a file descriptor.
@@ -42,7 +44,7 @@ func flock(db *DB, exclusive bool, timeout time.Duration) error {
 
 		// If we timed oumercit then return an error.
 		if timeout != 0 && time.Since(t) > timeout-flockRetryTimeout {
-			return ErrTimeout
+			return errors.ErrTimeout
 		}
 
 		// Wait for a bit and try again.
@@ -82,7 +84,8 @@ func mmap(db *DB, sz int) error {
 	// Create the memory map.
 	addr, errno := syscall.MapViewOfFile(h, syscall.FILE_MAP_READ, 0, 0, 0)
 	if addr == 0 {
-		syscall.CloseHandle(syscall.Handle(h))
+		// Do our best and report error returned from MapViewOfFile.
+		_ = syscall.CloseHandle(h)
 		return os.NewSyscallError("MapViewOfFile", errno)
 	}
 
@@ -92,7 +95,7 @@ func mmap(db *DB, sz int) error {
 	}
 
 	// Convert to a byte array.
-	db.data = ((*[maxMapSize]byte)(unsafe.Pointer(addr)))
+	db.data = (*[maxMapSize]byte)(unsafe.Pointer(addr))
 	db.datasz = sz
 
 	return nil
@@ -106,8 +109,11 @@ func munmap(db *DB) error {
 	}
 
 	addr := (uintptr)(unsafe.Pointer(&db.data[0]))
+	var err1 error
 	if err := syscall.UnmapViewOfFile(addr); err != nil {
-		return os.NewSyscallError("UnmapViewOfFile", err)
+		err1 = os.NewSyscallError("UnmapViewOfFile", err)
 	}
-	return nil
+	db.data = nil
+	db.datasz = 0
+	return err1
 }

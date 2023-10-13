@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"fmt"
 	"unsafe"
+
+	"go.etcd.io/bbolt/errors"
+	"go.etcd.io/bbolt/internal/common"
 )
 
 const (
@@ -13,8 +16,6 @@ const (
 	// MaxValueSize is the maximum length of a value, in bytes.
 	MaxValueSize = (1 << 31) - 2
 )
-
-const bucketHeaderSize = int(unsafe.Sizeof(bucket{}))
 
 const (
 	minFillPercent = 0.1
@@ -27,12 +28,12 @@ const DefaultFillPercent = 0.5
 
 // Bucket represents a collection of key/value pairs inside the database.
 type Bucket struct {
-	*bucket
-	tx       *Tx                // the associated transaction
-	buckets  map[string]*Bucket // subbucket cache
-	page     *page              // inline page reference
-	rootNode *node              // materialized node for the root page.
-	nodes    map[pgid]*node     // node cache
+	*common.InBucket
+	tx       *Tx                   // the associated transaction
+	buckets  map[string]*Bucket    // subbucket cache
+	page     *common.Page          // inline page reference
+	rootNode *node                 // materialized node for the root page.
+	nodes    map[common.Pgid]*node // node cache
 
 	// Sets the threshold for filling nodes when they split. By default,
 	// the bucket will fill to 50% but it can be useful to increase this
@@ -42,21 +43,12 @@ type Bucket struct {
 	FillPercent float64
 }
 
-// bucket represents the on-file representation of a bucket.
-// This is stored as the "value" of a bucket key. If the bucket is small enough,
-// then its root page can be stored inline in the "value", after the bucket
-// header. In the case of inline buckets, the "root" will be 0.
-type bucket struct {
-	root     pgid   // page id of the bucket's root-level page
-	sequence uint64 // monotonically incrementing, used by NextSequence()
-}
-
 // newBucket returns a new bucket associated with a transaction.
 func newBucket(tx *Tx) Bucket {
 	var b = Bucket{tx: tx, FillPercent: DefaultFillPercent}
 	if tx.writable {
 		b.buckets = make(map[string]*Bucket)
-		b.nodes = make(map[pgid]*node)
+		b.nodes = make(map[common.Pgid]*node)
 	}
 	return b
 }
@@ -67,8 +59,8 @@ func (b *Bucket) Tx() *Tx {
 }
 
 // Root returns the root of the bucket.
-func (b *Bucket) Root() pgid {
-	return b.root
+func (b *Bucket) Root() common.Pgid {
+	return b.RootPage()
 }
 
 // Writable returns whether the bucket is writable.
@@ -81,7 +73,7 @@ func (b *Bucket) Writable() bool {
 // Do not use a cursor after the transaction is closed.
 func (b *Bucket) Cursor() *Cursor {
 	// Update transaction statistics.
-	b.tx.stats.CursorCount++
+	b.tx.stats.IncCursorCount(1)
 
 	// Allocate and return a cursor.
 	return &Cursor{
@@ -105,7 +97,7 @@ func (b *Bucket) Bucket(name []byte) *Bucket {
 	k, v, flags := c.seek(name)
 
 	// Return nil if the key doesn't exist or it is not a bucket.
-	if !bytes.Equal(name, k) || (flags&bucketLeafFlag) == 0 {
+	if !bytes.Equal(name, k) || (flags&common.BucketLeafFlag) == 0 {
 		return nil
 	}
 
@@ -125,8 +117,8 @@ func (b *Bucket) openBucket(value []byte) *Bucket {
 
 	// Unaligned access requires a copy to be made.
 	const unalignedMask = unsafe.Alignof(struct {
-		bucket
-		page
+		common.InBucket
+		common.Page
 	}{}) - 1
 	unaligned := uintptr(unsafe.Pointer(&value[0]))&unalignedMask != 0
 	if unaligned {
@@ -136,15 +128,15 @@ func (b *Bucket) openBucket(value []byte) *Bucket {
 	// If this is a writable transaction then we need to copy the bucket entry.
 	// Read-only transactions can point directly at the mmap entry.
 	if b.tx.writable && !unaligned {
-		child.bucket = &bucket{}
-		*child.bucket = *(*bucket)(unsafe.Pointer(&value[0]))
+		child.InBucket = &common.InBucket{}
+		*child.InBucket = *(*common.InBucket)(unsafe.Pointer(&value[0]))
 	} else {
-		child.bucket = (*bucket)(unsafe.Pointer(&value[0]))
+		child.InBucket = (*common.InBucket)(unsafe.Pointer(&value[0]))
 	}
 
 	// Save a reference to the inline page if the bucket is inline.
-	if child.root == 0 {
-		child.page = (*page)(unsafe.Pointer(&value[bucketHeaderSize]))
+	if child.RootPage() == 0 {
+		child.page = (*common.Page)(unsafe.Pointer(&value[common.BucketHeaderSize]))
 	}
 
 	return &child
@@ -155,11 +147,11 @@ func (b *Bucket) openBucket(value []byte) *Bucket {
 // The bucket instance is only valid for the lifetime of the transaction.
 func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 	if b.tx.db == nil {
-		return nil, ErrTxClosed
+		return nil, errors.ErrTxClosed
 	} else if !b.tx.writable {
-		return nil, ErrTxNotWritable
+		return nil, errors.ErrTxNotWritable
 	} else if len(key) == 0 {
-		return nil, ErrBucketNameRequired
+		return nil, errors.ErrBucketNameRequired
 	}
 
 	// Move cursor to correct position.
@@ -168,52 +160,98 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 
 	// Return an error if there is an existing key.
 	if bytes.Equal(key, k) {
-		if (flags & bucketLeafFlag) != 0 {
-			return nil, ErrBucketExists
+		if (flags & common.BucketLeafFlag) != 0 {
+			return nil, errors.ErrBucketExists
 		}
-		return nil, ErrIncompatibleValue
+		return nil, errors.ErrIncompatibleValue
 	}
 
 	// Create empty, inline bucket.
 	var bucket = Bucket{
-		bucket:      &bucket{},
+		InBucket:    &common.InBucket{},
 		rootNode:    &node{isLeaf: true},
 		FillPercent: DefaultFillPercent,
 	}
 	var value = bucket.write()
 
 	// Insert into node.
-	key = cloneBytes(key)
-	c.node().put(key, key, value, 0, bucketLeafFlag)
+	// Tip: Use a new variable `newKey` instead of reusing the existing `key` to prevent
+	// it from being marked as leaking, and accordingly cannot be allocated on stack.
+	newKey := cloneBytes(key)
+	c.node().put(newKey, newKey, value, 0, common.BucketLeafFlag)
 
 	// Since subbuckets are not allowed on inline buckets, we need to
 	// dereference the inline page, if it exists. This will cause the bucket
 	// to be treated as a regular, non-inline bucket for the rest of the tx.
 	b.page = nil
 
-	return b.Bucket(key), nil
+	return b.Bucket(newKey), nil
 }
 
 // CreateBucketIfNotExists creates a new bucket if it doesn't already exist and returns a reference to it.
 // Returns an error if the bucket name is blank, or if the bucket name is too long.
 // The bucket instance is only valid for the lifetime of the transaction.
 func (b *Bucket) CreateBucketIfNotExists(key []byte) (*Bucket, error) {
-	child, err := b.CreateBucket(key)
-	if err == ErrBucketExists {
-		return b.Bucket(key), nil
-	} else if err != nil {
-		return nil, err
+	if b.tx.db == nil {
+		return nil, errors.ErrTxClosed
+	} else if !b.tx.writable {
+		return nil, errors.ErrTxNotWritable
+	} else if len(key) == 0 {
+		return nil, errors.ErrBucketNameRequired
 	}
-	return child, nil
+
+	if b.buckets != nil {
+		if child := b.buckets[string(key)]; child != nil {
+			return child, nil
+		}
+	}
+
+	// Move cursor to correct position.
+	c := b.Cursor()
+	k, v, flags := c.seek(key)
+
+	// Return an error if there is an existing non-bucket key.
+	if bytes.Equal(key, k) {
+		if (flags & common.BucketLeafFlag) != 0 {
+			var child = b.openBucket(v)
+			if b.buckets != nil {
+				b.buckets[string(key)] = child
+			}
+
+			return child, nil
+		}
+		return nil, errors.ErrIncompatibleValue
+	}
+
+	// Create empty, inline bucket.
+	var bucket = Bucket{
+		InBucket:    &common.InBucket{},
+		rootNode:    &node{isLeaf: true},
+		FillPercent: DefaultFillPercent,
+	}
+	var value = bucket.write()
+
+	// Insert into node.
+	// Tip: Use a new variable `newKey` instead of reusing the existing `key` to prevent
+	// it from being marked as leaking, and accordingly cannot be allocated on stack.
+	newKey := cloneBytes(key)
+	c.node().put(newKey, newKey, value, 0, common.BucketLeafFlag)
+
+	// Since subbuckets are not allowed on inline buckets, we need to
+	// dereference the inline page, if it exists. This will cause the bucket
+	// to be treated as a regular, non-inline bucket for the rest of the tx.
+	b.page = nil
+
+	return b.Bucket(newKey), nil
 }
 
 // DeleteBucket deletes a bucket at the given key.
 // Returns an error if the bucket does not exist, or if the key represents a non-bucket value.
 func (b *Bucket) DeleteBucket(key []byte) error {
 	if b.tx.db == nil {
-		return ErrTxClosed
+		return errors.ErrTxClosed
 	} else if !b.Writable() {
-		return ErrTxNotWritable
+		return errors.ErrTxNotWritable
 	}
 
 	// Move cursor to correct position.
@@ -222,18 +260,16 @@ func (b *Bucket) DeleteBucket(key []byte) error {
 
 	// Return an error if bucket doesn't exist or is not a bucket.
 	if !bytes.Equal(key, k) {
-		return ErrBucketNotFound
-	} else if (flags & bucketLeafFlag) == 0 {
-		return ErrIncompatibleValue
+		return errors.ErrBucketNotFound
+	} else if (flags & common.BucketLeafFlag) == 0 {
+		return errors.ErrIncompatibleValue
 	}
 
 	// Recursively delete all child buckets.
 	child := b.Bucket(key)
-	err := child.ForEach(func(k, v []byte) error {
-		if _, _, childFlags := child.Cursor().seek(k); (childFlags & bucketLeafFlag) != 0 {
-			if err := child.DeleteBucket(k); err != nil {
-				return fmt.Errorf("delete bucket: %s", err)
-			}
+	err := child.ForEachBucket(func(k []byte) error {
+		if err := child.DeleteBucket(k); err != nil {
+			return fmt.Errorf("delete bucket: %s", err)
 		}
 		return nil
 	})
@@ -258,11 +294,12 @@ func (b *Bucket) DeleteBucket(key []byte) error {
 // Get retrieves the value for a key in the bucket.
 // Returns a nil value if the key does not exist or if the key is a nested bucket.
 // The returned value is only valid for the life of the transaction.
+// The returned memory is owned by bbolt and must never be modified; writing to this memory might corrupt the database.
 func (b *Bucket) Get(key []byte) []byte {
 	k, v, flags := b.Cursor().seek(key)
 
 	// Return nil if this is a bucket.
-	if (flags & bucketLeafFlag) != 0 {
+	if (flags & common.BucketLeafFlag) != 0 {
 		return nil
 	}
 
@@ -279,15 +316,15 @@ func (b *Bucket) Get(key []byte) []byte {
 // Returns an error if the bucket was created from a read-only transaction, if the key is blank, if the key is too large, or if the value is too large.
 func (b *Bucket) Put(key []byte, value []byte) error {
 	if b.tx.db == nil {
-		return ErrTxClosed
+		return errors.ErrTxClosed
 	} else if !b.Writable() {
-		return ErrTxNotWritable
+		return errors.ErrTxNotWritable
 	} else if len(key) == 0 {
-		return ErrKeyRequired
+		return errors.ErrKeyRequired
 	} else if len(key) > MaxKeySize {
-		return ErrKeyTooLarge
+		return errors.ErrKeyTooLarge
 	} else if int64(len(value)) > MaxValueSize {
-		return ErrValueTooLarge
+		return errors.ErrValueTooLarge
 	}
 
 	// Move cursor to correct position.
@@ -295,13 +332,15 @@ func (b *Bucket) Put(key []byte, value []byte) error {
 	k, _, flags := c.seek(key)
 
 	// Return an error if there is an existing key with a bucket value.
-	if bytes.Equal(key, k) && (flags&bucketLeafFlag) != 0 {
-		return ErrIncompatibleValue
+	if bytes.Equal(key, k) && (flags&common.BucketLeafFlag) != 0 {
+		return errors.ErrIncompatibleValue
 	}
 
 	// Insert into node.
-	key = cloneBytes(key)
-	c.node().put(key, key, value, 0, 0)
+	// Tip: Use a new variable `newKey` instead of reusing the existing `key` to prevent
+	// it from being marked as leaking, and accordingly cannot be allocated on stack.
+	newKey := cloneBytes(key)
+	c.node().put(newKey, newKey, value, 0, 0)
 
 	return nil
 }
@@ -311,9 +350,9 @@ func (b *Bucket) Put(key []byte, value []byte) error {
 // Returns an error if the bucket was created from a read-only transaction.
 func (b *Bucket) Delete(key []byte) error {
 	if b.tx.db == nil {
-		return ErrTxClosed
+		return errors.ErrTxClosed
 	} else if !b.Writable() {
-		return ErrTxNotWritable
+		return errors.ErrTxNotWritable
 	}
 
 	// Move cursor to correct position.
@@ -326,8 +365,8 @@ func (b *Bucket) Delete(key []byte) error {
 	}
 
 	// Return an error if there is already existing bucket value.
-	if (flags & bucketLeafFlag) != 0 {
-		return ErrIncompatibleValue
+	if (flags & common.BucketLeafFlag) != 0 {
+		return errors.ErrIncompatibleValue
 	}
 
 	// Delete the node if we have a matching key.
@@ -337,53 +376,56 @@ func (b *Bucket) Delete(key []byte) error {
 }
 
 // Sequence returns the current integer for the bucket without incrementing it.
-func (b *Bucket) Sequence() uint64 { return b.bucket.sequence }
+func (b *Bucket) Sequence() uint64 {
+	return b.InSequence()
+}
 
 // SetSequence updates the sequence number for the bucket.
 func (b *Bucket) SetSequence(v uint64) error {
 	if b.tx.db == nil {
-		return ErrTxClosed
+		return errors.ErrTxClosed
 	} else if !b.Writable() {
-		return ErrTxNotWritable
+		return errors.ErrTxNotWritable
 	}
 
 	// Materialize the root node if it hasn't been already so that the
 	// bucket will be saved during commit.
 	if b.rootNode == nil {
-		_ = b.node(b.root, nil)
+		_ = b.node(b.RootPage(), nil)
 	}
 
-	// Increment and return the sequence.
-	b.bucket.sequence = v
+	// Set the sequence.
+	b.SetInSequence(v)
 	return nil
 }
 
 // NextSequence returns an autoincrementing integer for the bucket.
 func (b *Bucket) NextSequence() (uint64, error) {
 	if b.tx.db == nil {
-		return 0, ErrTxClosed
+		return 0, errors.ErrTxClosed
 	} else if !b.Writable() {
-		return 0, ErrTxNotWritable
+		return 0, errors.ErrTxNotWritable
 	}
 
 	// Materialize the root node if it hasn't been already so that the
 	// bucket will be saved during commit.
 	if b.rootNode == nil {
-		_ = b.node(b.root, nil)
+		_ = b.node(b.RootPage(), nil)
 	}
 
 	// Increment and return the sequence.
-	b.bucket.sequence++
-	return b.bucket.sequence, nil
+	b.IncSequence()
+	return b.Sequence(), nil
 }
 
 // ForEach executes a function for each key/value pair in a bucket.
+// Because ForEach uses a Cursor, the iteration over keys is in lexicographical order.
 // If the provided function returns an error then the iteration is stopped and
 // the error is returned to the caller. The provided function must not modify
 // the bucket; this will result in undefined behavior.
 func (b *Bucket) ForEach(fn func(k, v []byte) error) error {
 	if b.tx.db == nil {
-		return ErrTxClosed
+		return errors.ErrTxClosed
 	}
 	c := b.Cursor()
 	for k, v := c.First(); k != nil; k, v = c.Next() {
@@ -394,74 +436,89 @@ func (b *Bucket) ForEach(fn func(k, v []byte) error) error {
 	return nil
 }
 
-// Stat returns stats on a bucket.
+func (b *Bucket) ForEachBucket(fn func(k []byte) error) error {
+	if b.tx.db == nil {
+		return errors.ErrTxClosed
+	}
+	c := b.Cursor()
+	for k, _, flags := c.first(); k != nil; k, _, flags = c.next() {
+		if flags&common.BucketLeafFlag != 0 {
+			if err := fn(k); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Stats returns stats on a bucket.
 func (b *Bucket) Stats() BucketStats {
 	var s, subStats BucketStats
 	pageSize := b.tx.db.pageSize
 	s.BucketN += 1
-	if b.root == 0 {
+	if b.RootPage() == 0 {
 		s.InlineBucketN += 1
 	}
-	b.forEachPage(func(p *page, depth int) {
-		if (p.flags & leafPageFlag) != 0 {
-			s.KeyN += int(p.count)
+	b.forEachPage(func(p *common.Page, depth int, pgstack []common.Pgid) {
+		if p.IsLeafPage() {
+			s.KeyN += int(p.Count())
 
 			// used totals the used bytes for the page
-			used := pageHeaderSize
+			used := common.PageHeaderSize
 
-			if p.count != 0 {
+			if p.Count() != 0 {
 				// If page has any elements, add all element headers.
-				used += leafPageElementSize * uintptr(p.count-1)
+				used += common.LeafPageElementSize * uintptr(p.Count()-1)
 
 				// Add all element key, value sizes.
 				// The computation takes advantage of the fact that the position
 				// of the last element's key/value equals to the total of the sizes
 				// of all previous elements' keys and values.
 				// It also includes the last element's header.
-				lastElement := p.leafPageElement(p.count - 1)
-				used += uintptr(lastElement.pos + lastElement.ksize + lastElement.vsize)
+				lastElement := p.LeafPageElement(p.Count() - 1)
+				used += uintptr(lastElement.Pos() + lastElement.Ksize() + lastElement.Vsize())
 			}
 
-			if b.root == 0 {
+			if b.RootPage() == 0 {
 				// For inlined bucket just update the inline stats
 				s.InlineBucketInuse += int(used)
 			} else {
 				// For non-inlined bucket update all the leaf stats
 				s.LeafPageN++
 				s.LeafInuse += int(used)
-				s.LeafOverflowN += int(p.overflow)
+				s.LeafOverflowN += int(p.Overflow())
 
 				// Collect stats from sub-buckets.
 				// Do that by iterating over all element headers
 				// looking for the ones with the bucketLeafFlag.
-				for i := uint16(0); i < p.count; i++ {
-					e := p.leafPageElement(i)
-					if (e.flags & bucketLeafFlag) != 0 {
+				for i := uint16(0); i < p.Count(); i++ {
+					e := p.LeafPageElement(i)
+					if (e.Flags() & common.BucketLeafFlag) != 0 {
 						// For any bucket element, open the element value
 						// and recursively call Stats on the contained bucket.
-						subStats.Add(b.openBucket(e.value()).Stats())
+						subStats.Add(b.openBucket(e.Value()).Stats())
 					}
 				}
 			}
-		} else if (p.flags & branchPageFlag) != 0 {
+		} else if p.IsBranchPage() {
 			s.BranchPageN++
-			lastElement := p.branchPageElement(p.count - 1)
+			lastElement := p.BranchPageElement(p.Count() - 1)
 
 			// used totals the used bytes for the page
 			// Add header and all element headers.
-			used := pageHeaderSize + (branchPageElementSize * uintptr(p.count-1))
+			used := common.PageHeaderSize + (common.BranchPageElementSize * uintptr(p.Count()-1))
 
 			// Add size of all keys and values.
 			// Again, use the fact that last element's position equals to
 			// the total of key, value sizes of all previous elements.
-			used += uintptr(lastElement.pos + lastElement.ksize)
+			used += uintptr(lastElement.Pos() + lastElement.Ksize())
 			s.BranchInuse += int(used)
-			s.BranchOverflowN += int(p.overflow)
+			s.BranchOverflowN += int(p.Overflow())
 		}
 
 		// Keep track of maximum page depth.
 		if depth+1 > s.Depth {
-			s.Depth = (depth + 1)
+			s.Depth = depth + 1
 		}
 	})
 
@@ -477,46 +534,46 @@ func (b *Bucket) Stats() BucketStats {
 }
 
 // forEachPage iterates over every page in a bucket, including inline pages.
-func (b *Bucket) forEachPage(fn func(*page, int)) {
+func (b *Bucket) forEachPage(fn func(*common.Page, int, []common.Pgid)) {
 	// If we have an inline page then just use that.
 	if b.page != nil {
-		fn(b.page, 0)
+		fn(b.page, 0, []common.Pgid{b.RootPage()})
 		return
 	}
 
 	// Otherwise traverse the page hierarchy.
-	b.tx.forEachPage(b.root, 0, fn)
+	b.tx.forEachPage(b.RootPage(), fn)
 }
 
 // forEachPageNode iterates over every page (or node) in a bucket.
 // This also includes inline pages.
-func (b *Bucket) forEachPageNode(fn func(*page, *node, int)) {
+func (b *Bucket) forEachPageNode(fn func(*common.Page, *node, int)) {
 	// If we have an inline page or root node then just use that.
 	if b.page != nil {
 		fn(b.page, nil, 0)
 		return
 	}
-	b._forEachPageNode(b.root, 0, fn)
+	b._forEachPageNode(b.RootPage(), 0, fn)
 }
 
-func (b *Bucket) _forEachPageNode(pgid pgid, depth int, fn func(*page, *node, int)) {
-	var p, n = b.pageNode(pgid)
+func (b *Bucket) _forEachPageNode(pgId common.Pgid, depth int, fn func(*common.Page, *node, int)) {
+	var p, n = b.pageNode(pgId)
 
 	// Execute function.
 	fn(p, n, depth)
 
 	// Recursively loop over children.
 	if p != nil {
-		if (p.flags & branchPageFlag) != 0 {
-			for i := 0; i < int(p.count); i++ {
-				elem := p.branchPageElement(uint16(i))
-				b._forEachPageNode(elem.pgid, depth+1, fn)
+		if p.IsBranchPage() {
+			for i := 0; i < int(p.Count()); i++ {
+				elem := p.BranchPageElement(uint16(i))
+				b._forEachPageNode(elem.Pgid(), depth+1, fn)
 			}
 		}
 	} else {
 		if !n.isLeaf {
 			for _, inode := range n.inodes {
-				b._forEachPageNode(inode.pgid, depth+1, fn)
+				b._forEachPageNode(inode.Pgid(), depth+1, fn)
 			}
 		}
 	}
@@ -539,9 +596,9 @@ func (b *Bucket) spill() error {
 			}
 
 			// Update the child bucket header in this bucket.
-			value = make([]byte, unsafe.Sizeof(bucket{}))
-			var bucket = (*bucket)(unsafe.Pointer(&value[0]))
-			*bucket = *child.bucket
+			value = make([]byte, unsafe.Sizeof(common.InBucket{}))
+			var bucket = (*common.InBucket)(unsafe.Pointer(&value[0]))
+			*bucket = *child.InBucket
 		}
 
 		// Skip writing the bucket if there are no materialized nodes.
@@ -555,10 +612,10 @@ func (b *Bucket) spill() error {
 		if !bytes.Equal([]byte(name), k) {
 			panic(fmt.Sprintf("misplaced bucket header: %x -> %x", []byte(name), k))
 		}
-		if flags&bucketLeafFlag == 0 {
+		if flags&common.BucketLeafFlag == 0 {
 			panic(fmt.Sprintf("unexpected bucket header flag: %x", flags))
 		}
-		c.node().put([]byte(name), []byte(name), value, 0, bucketLeafFlag)
+		c.node().put([]byte(name), []byte(name), value, 0, common.BucketLeafFlag)
 	}
 
 	// Ignore if there's not a materialized root node.
@@ -573,16 +630,16 @@ func (b *Bucket) spill() error {
 	b.rootNode = b.rootNode.root()
 
 	// Update the root node for this bucket.
-	if b.rootNode.pgid >= b.tx.meta.pgid {
-		panic(fmt.Sprintf("pgid (%d) above high water mark (%d)", b.rootNode.pgid, b.tx.meta.pgid))
+	if b.rootNode.pgid >= b.tx.meta.Pgid() {
+		panic(fmt.Sprintf("pgid (%d) above high water mark (%d)", b.rootNode.pgid, b.tx.meta.Pgid()))
 	}
-	b.root = b.rootNode.pgid
+	b.SetRootPage(b.rootNode.pgid)
 
 	return nil
 }
 
 // inlineable returns true if a bucket is small enough to be written inline
-// and if it contains no subbuckets. Otherwise returns false.
+// and if it contains no subbuckets. Otherwise, returns false.
 func (b *Bucket) inlineable() bool {
 	var n = b.rootNode
 
@@ -593,11 +650,11 @@ func (b *Bucket) inlineable() bool {
 
 	// Bucket is not inlineable if it contains subbuckets or if it goes beyond
 	// our threshold for inline bucket size.
-	var size = pageHeaderSize
+	var size = common.PageHeaderSize
 	for _, inode := range n.inodes {
-		size += leafPageElementSize + uintptr(len(inode.key)) + uintptr(len(inode.value))
+		size += common.LeafPageElementSize + uintptr(len(inode.Key())) + uintptr(len(inode.Value()))
 
-		if inode.flags&bucketLeafFlag != 0 {
+		if inode.Flags()&common.BucketLeafFlag != 0 {
 			return false
 		} else if size > b.maxInlineBucketSize() {
 			return false
@@ -616,14 +673,14 @@ func (b *Bucket) maxInlineBucketSize() uintptr {
 func (b *Bucket) write() []byte {
 	// Allocate the appropriate size.
 	var n = b.rootNode
-	var value = make([]byte, bucketHeaderSize+n.size())
+	var value = make([]byte, common.BucketHeaderSize+n.size())
 
 	// Write a bucket header.
-	var bucket = (*bucket)(unsafe.Pointer(&value[0]))
-	*bucket = *b.bucket
+	var bucket = (*common.InBucket)(unsafe.Pointer(&value[0]))
+	*bucket = *b.InBucket
 
 	// Convert byte slice to a fake page and write the root node.
-	var p = (*page)(unsafe.Pointer(&value[bucketHeaderSize]))
+	var p = (*common.Page)(unsafe.Pointer(&value[common.BucketHeaderSize]))
 	n.write(p)
 
 	return value
@@ -640,11 +697,11 @@ func (b *Bucket) rebalance() {
 }
 
 // node creates a node from a page and associates it with a given parent.
-func (b *Bucket) node(pgid pgid, parent *node) *node {
-	_assert(b.nodes != nil, "nodes map expected")
+func (b *Bucket) node(pgId common.Pgid, parent *node) *node {
+	common.Assert(b.nodes != nil, "nodes map expected")
 
 	// Retrieve node if it's already been created.
-	if n := b.nodes[pgid]; n != nil {
+	if n := b.nodes[pgId]; n != nil {
 		return n
 	}
 
@@ -659,34 +716,34 @@ func (b *Bucket) node(pgid pgid, parent *node) *node {
 	// Use the inline page if this is an inline bucket.
 	var p = b.page
 	if p == nil {
-		p = b.tx.page(pgid)
+		p = b.tx.page(pgId)
 	}
 
 	// Read the page into the node and cache it.
 	n.read(p)
-	b.nodes[pgid] = n
+	b.nodes[pgId] = n
 
 	// Update statistics.
-	b.tx.stats.NodeCount++
+	b.tx.stats.IncNodeCount(1)
 
 	return n
 }
 
 // free recursively frees all pages in the bucket.
 func (b *Bucket) free() {
-	if b.root == 0 {
+	if b.RootPage() == 0 {
 		return
 	}
 
 	var tx = b.tx
-	b.forEachPageNode(func(p *page, n *node, _ int) {
+	b.forEachPageNode(func(p *common.Page, n *node, _ int) {
 		if p != nil {
-			tx.db.freelist.free(tx.meta.txid, p)
+			tx.db.freelist.free(tx.meta.Txid(), p)
 		} else {
 			n.free()
 		}
 	})
-	b.root = 0
+	b.SetRootPage(0)
 }
 
 // dereference removes all references to the old mmap.
@@ -701,11 +758,11 @@ func (b *Bucket) dereference() {
 }
 
 // pageNode returns the in-memory node, if it exists.
-// Otherwise returns the underlying page.
-func (b *Bucket) pageNode(id pgid) (*page, *node) {
+// Otherwise, returns the underlying page.
+func (b *Bucket) pageNode(id common.Pgid) (*common.Page, *node) {
 	// Inline buckets have a fake page embedded in their value so treat them
 	// differently. We'll return the rootNode (if available) or the fake page.
-	if b.root == 0 {
+	if b.RootPage() == 0 {
 		if id != 0 {
 			panic(fmt.Sprintf("inline bucket non-zero page access(2): %d != 0", id))
 		}

@@ -4,23 +4,26 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"flag"
 	"fmt"
 	"hash/fnv"
 	"log"
 	"math/rand"
 	"os"
 	"path/filepath"
-	"regexp"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 	"unsafe"
 
-	bolt "go.etcd.io/bbolt"
-)
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-var statsFlag = flag.Bool("stats", false, "show performance stats")
+	bolt "go.etcd.io/bbolt"
+	berrors "go.etcd.io/bbolt/errors"
+	"go.etcd.io/bbolt/internal/btesting"
+)
 
 // pageSize is the size of one page in the data file.
 const pageSize = 4096
@@ -46,7 +49,7 @@ func TestOpen(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := bolt.Open(path, 0666, nil)
+	db, err := bolt.Open(path, 0600, nil)
 	if err != nil {
 		t.Fatal(err)
 	} else if db == nil {
@@ -105,7 +108,7 @@ func TestOpen_MultipleGoroutines(t *testing.T) {
 
 // Ensure that opening a database with a blank path returns an error.
 func TestOpen_ErrPathRequired(t *testing.T) {
-	_, err := bolt.Open("", 0666, nil)
+	_, err := bolt.Open("", 0600, nil)
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -113,7 +116,7 @@ func TestOpen_ErrPathRequired(t *testing.T) {
 
 // Ensure that opening a database with a bad path returns an error.
 func TestOpen_ErrNotExists(t *testing.T) {
-	_, err := bolt.Open(filepath.Join(tempfile(), "bad-path"), 0666, nil)
+	_, err := bolt.Open(filepath.Join(tempfile(), "bad-path"), 0600, nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -135,7 +138,7 @@ func TestOpen_ErrInvalid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := bolt.Open(path, 0666, nil); err != bolt.ErrInvalid {
+	if _, err := bolt.Open(path, 0600, nil); err != berrors.ErrInvalid {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -147,12 +150,11 @@ func TestOpen_ErrVersionMismatch(t *testing.T) {
 	}
 
 	// Create empty database.
-	db := MustOpenDB()
+	db := btesting.MustCreateDB(t)
 	path := db.Path()
-	defer db.MustClose()
 
 	// Close database.
-	if err := db.DB.Close(); err != nil {
+	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -172,7 +174,7 @@ func TestOpen_ErrVersionMismatch(t *testing.T) {
 	}
 
 	// Reopen data file.
-	if _, err := bolt.Open(path, 0666, nil); err != bolt.ErrVersionMismatch {
+	if _, err := bolt.Open(path, 0600, nil); err != berrors.ErrVersionMismatch {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -184,12 +186,11 @@ func TestOpen_ErrChecksum(t *testing.T) {
 	}
 
 	// Create empty database.
-	db := MustOpenDB()
+	db := btesting.MustCreateDB(t)
 	path := db.Path()
-	defer db.MustClose()
 
 	// Close database.
-	if err := db.DB.Close(); err != nil {
+	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -209,8 +210,68 @@ func TestOpen_ErrChecksum(t *testing.T) {
 	}
 
 	// Reopen data file.
-	if _, err := bolt.Open(path, 0666, nil); err != bolt.ErrChecksum {
+	if _, err := bolt.Open(path, 0600, nil); err != berrors.ErrChecksum {
 		t.Fatalf("unexpected error: %s", err)
+	}
+}
+
+// Ensure that it can read the page size from the second meta page if the first one is invalid.
+// The page size is expected to be the OS's page size in this case.
+func TestOpen_ReadPageSize_FromMeta1_OS(t *testing.T) {
+	// Create empty database.
+	db := btesting.MustCreateDB(t)
+	path := db.Path()
+	// Close the database
+	db.MustClose()
+
+	// Read data file.
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rewrite first meta page.
+	meta0 := (*meta)(unsafe.Pointer(&buf[pageHeaderSize]))
+	meta0.pgid++
+	if err := os.WriteFile(path, buf, 0666); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen data file.
+	db = btesting.MustOpenDBWithOption(t, path, nil)
+	require.Equalf(t, os.Getpagesize(), db.Info().PageSize, "check page size failed")
+}
+
+// Ensure that it can read the page size from the second meta page if the first one is invalid.
+// The page size is expected to be the given page size in this case.
+func TestOpen_ReadPageSize_FromMeta1_Given(t *testing.T) {
+	// test page size from 1KB (1024<<0) to 16MB(1024<<14)
+	for i := 0; i <= 14; i++ {
+		givenPageSize := 1024 << uint(i)
+		t.Logf("Testing page size %d", givenPageSize)
+		// Create empty database.
+		db := btesting.MustCreateDBWithOption(t, &bolt.Options{PageSize: givenPageSize})
+		path := db.Path()
+		// Close the database
+		db.MustClose()
+
+		// Read data file.
+		buf, err := os.ReadFile(path)
+		require.NoError(t, err)
+
+		// Rewrite meta pages.
+		if i%3 == 0 {
+			t.Logf("#%d: Intentionally corrupt the first meta page for pageSize %d", i, givenPageSize)
+			meta0 := (*meta)(unsafe.Pointer(&buf[pageHeaderSize]))
+			meta0.pgid++
+			err = os.WriteFile(path, buf, 0666)
+			require.NoError(t, err)
+		}
+
+		// Reopen data file.
+		db = btesting.MustOpenDBWithOption(t, path, nil)
+		require.Equalf(t, givenPageSize, db.Info().PageSize, "check page size failed")
+		db.MustClose()
 	}
 }
 
@@ -218,40 +279,29 @@ func TestOpen_ErrChecksum(t *testing.T) {
 // https://github.com/boltdb/bolt/issues/291
 func TestOpen_Size(t *testing.T) {
 	// Open a data file.
-	db := MustOpenDB()
-	path := db.Path()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 
 	pagesize := db.Info().PageSize
 
 	// Insert until we get above the minimum 4MB size.
-	if err := db.Update(func(tx *bolt.Tx) error {
-		b, _ := tx.CreateBucketIfNotExists([]byte("data"))
-		for i := 0; i < 10000; i++ {
-			if err := b.Put([]byte(fmt.Sprintf("%04d", i)), make([]byte, 1000)); err != nil {
-				t.Fatal(err)
-			}
-		}
-		return nil
-	}); err != nil {
+	err := db.Fill([]byte("data"), 1, 10000,
+		func(tx int, k int) []byte { return []byte(fmt.Sprintf("%04d", k)) },
+		func(tx int, k int) []byte { return make([]byte, 1000) },
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Close database and grab the size.
-	if err := db.DB.Close(); err != nil {
-		t.Fatal(err)
-	}
+	path := db.Path()
+	db.MustClose()
+
 	sz := fileSize(path)
 	if sz == 0 {
 		t.Fatalf("unexpected new file size: %d", sz)
 	}
 
-	// Reopen database, update, and check size again.
-	db0, err := bolt.Open(path, 0666, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db0.Update(func(tx *bolt.Tx) error {
+	db.MustReopen()
+	if err := db.Update(func(tx *bolt.Tx) error {
 		if err := tx.Bucket([]byte("data")).Put([]byte{0}, []byte{0}); err != nil {
 			t.Fatal(err)
 		}
@@ -259,7 +309,7 @@ func TestOpen_Size(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db0.Close(); err != nil {
+	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 	newSz := fileSize(path)
@@ -282,9 +332,8 @@ func TestOpen_Size_Large(t *testing.T) {
 	}
 
 	// Open a data file.
-	db := MustOpenDB()
+	db := btesting.MustCreateDB(t)
 	path := db.Path()
-	defer db.MustClose()
 
 	pagesize := db.Info().PageSize
 
@@ -306,7 +355,7 @@ func TestOpen_Size_Large(t *testing.T) {
 	}
 
 	// Close database and grab the size.
-	if err := db.DB.Close(); err != nil {
+	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 	sz := fileSize(path)
@@ -317,7 +366,7 @@ func TestOpen_Size_Large(t *testing.T) {
 	}
 
 	// Reopen database, update, and check size again.
-	db0, err := bolt.Open(path, 0666, nil)
+	db0, err := bolt.Open(path, 0600, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +396,7 @@ func TestOpen_Check(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := bolt.Open(path, 0666, nil)
+	db, err := bolt.Open(path, 0600, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +407,7 @@ func TestOpen_Check(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = bolt.Open(path, 0666, nil)
+	db, err = bolt.Open(path, 0600, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +429,7 @@ func TestOpen_FileTooSmall(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := bolt.Open(path, 0666, nil)
+	db, err := bolt.Open(path, 0600, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,8 +443,8 @@ func TestOpen_FileTooSmall(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = bolt.Open(path, 0666, nil)
-	if err == nil || err.Error() != "file size too small" {
+	_, err = bolt.Open(path, 0600, nil)
+	if err == nil || !strings.Contains(err.Error(), "file size too small") {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -411,7 +460,7 @@ func TestDB_Open_InitialMmapSize(t *testing.T) {
 	initMmapSize := 1 << 30  // 1GB
 	testWriteSize := 1 << 27 // 134MB
 
-	db, err := bolt.Open(path, 0666, &bolt.Options{InitialMmapSize: initMmapSize})
+	db, err := bolt.Open(path, 0600, &bolt.Options{InitialMmapSize: initMmapSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,8 +513,7 @@ func TestDB_Open_InitialMmapSize(t *testing.T) {
 // TestDB_Open_ReadOnly checks a database in read only mode can read but not write.
 func TestDB_Open_ReadOnly(t *testing.T) {
 	// Create a writable db, write k-v and close it.
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 
 	if err := db.Update(func(tx *bolt.Tx) error {
 		b, err := tx.CreateBucket([]byte("widgets"))
@@ -479,13 +527,13 @@ func TestDB_Open_ReadOnly(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.DB.Close(); err != nil {
+	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	f := db.f
+	f := db.Path()
 	o := &bolt.Options{ReadOnly: true}
-	readOnlyDB, err := bolt.Open(f, 0666, o)
+	readOnlyDB, err := bolt.Open(f, 0600, o)
 	if err != nil {
 		panic(err)
 	}
@@ -506,7 +554,7 @@ func TestDB_Open_ReadOnly(t *testing.T) {
 	}
 
 	// Can't launch read-write transaction.
-	if _, err := readOnlyDB.Begin(true); err != bolt.ErrDatabaseReadOnly {
+	if _, err := readOnlyDB.Begin(true); err != berrors.ErrDatabaseReadOnly {
 		t.Fatalf("unexpected error: %s", err)
 	}
 
@@ -515,18 +563,22 @@ func TestDB_Open_ReadOnly(t *testing.T) {
 	}
 }
 
+func TestDB_Open_ReadOnly_NoCreate(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "db")
+	_, err := bolt.Open(f, 0600, &bolt.Options{ReadOnly: true})
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
 // TestOpen_BigPage checks the database uses bigger pages when
 // changing PageSize.
 func TestOpen_BigPage(t *testing.T) {
 	pageSize := os.Getpagesize()
 
-	db1 := MustOpenWithOption(&bolt.Options{PageSize: pageSize * 2})
-	defer db1.MustClose()
+	db1 := btesting.MustCreateDBWithOption(t, &bolt.Options{PageSize: pageSize * 2})
 
-	db2 := MustOpenWithOption(&bolt.Options{PageSize: pageSize * 4})
-	defer db2.MustClose()
+	db2 := btesting.MustCreateDBWithOption(t, &bolt.Options{PageSize: pageSize * 4})
 
-	if db1sz, db2sz := fileSize(db1.f), fileSize(db2.f); db1sz >= db2sz {
+	if db1sz, db2sz := fileSize(db1.Path()), fileSize(db2.Path()); db1sz >= db2sz {
 		t.Errorf("expected %d < %d", db1sz, db2sz)
 	}
 }
@@ -535,8 +587,7 @@ func TestOpen_BigPage(t *testing.T) {
 // write-out after no free list sync will recover the free list
 // and write it out.
 func TestOpen_RecoverFreeList(t *testing.T) {
-	db := MustOpenWithOption(&bolt.Options{NoFreelistSync: true})
-	defer db.MustClose()
+	db := btesting.MustCreateDBWithOption(t, &bolt.Options{NoFreelistSync: true})
 
 	// Write some pages.
 	tx, err := db.Begin(true)
@@ -575,9 +626,7 @@ func TestOpen_RecoverFreeList(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.DB.Close(); err != nil {
-		t.Fatal(err)
-	}
+	db.MustClose()
 
 	// Record freelist count from opening with NoFreelistSync.
 	db.MustReopen()
@@ -585,12 +634,10 @@ func TestOpen_RecoverFreeList(t *testing.T) {
 	if freepages == 0 {
 		t.Fatalf("no free pages on NoFreelistSync reopen")
 	}
-	if err := db.DB.Close(); err != nil {
-		t.Fatal(err)
-	}
+	db.MustClose()
 
 	// Check free page count is reconstructed when opened with freelist sync.
-	db.o = &bolt.Options{}
+	db.SetOptions(&bolt.Options{})
 	db.MustReopen()
 	// One less free page for syncing the free list on open.
 	freepages--
@@ -602,40 +649,29 @@ func TestOpen_RecoverFreeList(t *testing.T) {
 // Ensure that a database cannot open a transaction when it's not open.
 func TestDB_Begin_ErrDatabaseNotOpen(t *testing.T) {
 	var db bolt.DB
-	if _, err := db.Begin(false); err != bolt.ErrDatabaseNotOpen {
+	if _, err := db.Begin(false); err != berrors.ErrDatabaseNotOpen {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
 
 // Ensure that a read-write transaction can be retrieved.
 func TestDB_BeginRW(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 
 	tx, err := db.Begin(true)
-	if err != nil {
-		t.Fatal(err)
-	} else if tx == nil {
-		t.Fatal("expected tx")
-	}
+	require.NoError(t, err)
+	require.NotNil(t, tx, "expected tx")
+	defer func() { require.NoError(t, tx.Commit()) }()
 
-	if tx.DB() != db.DB {
-		t.Fatal("unexpected tx database")
-	} else if !tx.Writable() {
-		t.Fatal("expected writable tx")
-	}
-
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
+	require.True(t, tx.Writable(), "expected writable tx")
+	require.Same(t, db.DB, tx.DB())
 }
 
 // TestDB_Concurrent_WriteTo checks that issuing WriteTo operations concurrently
 // with commits does not produce corrupted db files.
 func TestDB_Concurrent_WriteTo(t *testing.T) {
 	o := &bolt.Options{NoFreelistSync: false}
-	db := MustOpenWithOption(o)
-	defer db.MustClose()
+	db := btesting.MustCreateDBWithOption(t, o)
 
 	var wg sync.WaitGroup
 	wtxs, rtxs := 5, 5
@@ -647,11 +683,18 @@ func TestDB_Concurrent_WriteTo(t *testing.T) {
 			panic(err)
 		}
 		time.Sleep(time.Duration(rand.Intn(20)+1) * time.Millisecond)
-		tx.WriteTo(f)
-		tx.Rollback()
+		_, err = tx.WriteTo(f)
+		if err != nil {
+			panic(err)
+		}
+		err = tx.Rollback()
+		if err != nil {
+			panic(err)
+		}
 		f.Close()
-		snap := &DB{nil, f.Name(), o}
-		snap.MustReopen()
+
+		copyOpt := *o
+		snap := btesting.MustOpenDBWithOption(t, f.Name(), &copyOpt)
 		defer snap.MustClose()
 		snap.MustCheck()
 	}
@@ -692,7 +735,7 @@ func TestDB_Concurrent_WriteTo(t *testing.T) {
 // Ensure that opening a transaction while the DB is closed returns an error.
 func TestDB_BeginRW_Closed(t *testing.T) {
 	var db bolt.DB
-	if _, err := db.Begin(true); err != bolt.ErrDatabaseNotOpen {
+	if _, err := db.Begin(true); err != berrors.ErrDatabaseNotOpen {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -702,7 +745,7 @@ func TestDB_Close_PendingTx_RO(t *testing.T) { testDB_Close_PendingTx(t, false) 
 
 // Ensure that a database cannot close while transactions are open.
 func testDB_Close_PendingTx(t *testing.T, writable bool) {
-	db := MustOpenDB()
+	db := btesting.MustCreateDB(t)
 
 	// Start transaction.
 	tx, err := db.Begin(writable)
@@ -711,11 +754,15 @@ func testDB_Close_PendingTx(t *testing.T, writable bool) {
 	}
 
 	// Open update in separate goroutine.
+	startCh := make(chan struct{}, 1)
 	done := make(chan error, 1)
 	go func() {
+		startCh <- struct{}{}
 		err := db.Close()
 		done <- err
 	}()
+	// wait for the above goroutine to get scheduled.
+	<-startCh
 
 	// Ensure database hasn't closed.
 	time.Sleep(100 * time.Millisecond)
@@ -739,21 +786,19 @@ func testDB_Close_PendingTx(t *testing.T, writable bool) {
 	}
 
 	// Ensure database closed now.
-	time.Sleep(100 * time.Millisecond)
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("error from inside goroutine: %v", err)
 		}
-	default:
-		t.Fatal("database did not close")
+	case <-time.After(5 * time.Second):
+		t.Fatalf("database did not close")
 	}
 }
 
 // Ensure a database can provide a transactional block.
 func TestDB_Update(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 	if err := db.Update(func(tx *bolt.Tx) error {
 		b, err := tx.CreateBucket([]byte("widgets"))
 		if err != nil {
@@ -794,15 +839,14 @@ func TestDB_Update_Closed(t *testing.T) {
 			t.Fatal(err)
 		}
 		return nil
-	}); err != bolt.ErrDatabaseNotOpen {
+	}); err != berrors.ErrDatabaseNotOpen {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
 
 // Ensure a panic occurs while trying to commit a managed transaction.
 func TestDB_Update_ManualCommit(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 
 	var panicked bool
 	if err := db.Update(func(tx *bolt.Tx) error {
@@ -827,8 +871,7 @@ func TestDB_Update_ManualCommit(t *testing.T) {
 
 // Ensure a panic occurs while trying to rollback a managed transaction.
 func TestDB_Update_ManualRollback(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 
 	var panicked bool
 	if err := db.Update(func(tx *bolt.Tx) error {
@@ -853,8 +896,7 @@ func TestDB_Update_ManualRollback(t *testing.T) {
 
 // Ensure a panic occurs while trying to commit a managed transaction.
 func TestDB_View_ManualCommit(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 
 	var panicked bool
 	if err := db.View(func(tx *bolt.Tx) error {
@@ -879,8 +921,7 @@ func TestDB_View_ManualCommit(t *testing.T) {
 
 // Ensure a panic occurs while trying to rollback a managed transaction.
 func TestDB_View_ManualRollback(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 
 	var panicked bool
 	if err := db.View(func(tx *bolt.Tx) error {
@@ -905,8 +946,7 @@ func TestDB_View_ManualRollback(t *testing.T) {
 
 // Ensure a write transaction that panics does not hold open locks.
 func TestDB_Update_Panic(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 
 	// Panic during update but recover.
 	func() {
@@ -949,8 +989,7 @@ func TestDB_Update_Panic(t *testing.T) {
 
 // Ensure a database can return an error through a read-only transactional block.
 func TestDB_View_Error(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 
 	if err := db.View(func(tx *bolt.Tx) error {
 		return errors.New("xxx")
@@ -961,8 +1000,7 @@ func TestDB_View_Error(t *testing.T) {
 
 // Ensure a read transaction that panics does not hold open locks.
 func TestDB_View_Panic(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 
 	if err := db.Update(func(tx *bolt.Tx) error {
 		if _, err := tx.CreateBucket([]byte("widgets")); err != nil {
@@ -1004,8 +1042,7 @@ func TestDB_View_Panic(t *testing.T) {
 
 // Ensure that DB stats can be returned.
 func TestDB_Stats(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 	if err := db.Update(func(tx *bolt.Tx) error {
 		_, err := tx.CreateBucket([]byte("widgets"))
 		return err
@@ -1014,8 +1051,8 @@ func TestDB_Stats(t *testing.T) {
 	}
 
 	stats := db.Stats()
-	if stats.TxStats.PageCount != 2 {
-		t.Fatalf("unexpected TxStats.PageCount: %d", stats.TxStats.PageCount)
+	if stats.TxStats.GetPageCount() != 2 {
+		t.Fatalf("unexpected TxStats.PageCount: %d", stats.TxStats.GetPageCount())
 	} else if stats.FreePageN != 0 {
 		t.Fatalf("unexpected FreePageN != 0: %d", stats.FreePageN)
 	} else if stats.PendingPageN != 2 {
@@ -1025,8 +1062,7 @@ func TestDB_Stats(t *testing.T) {
 
 // Ensure that database pages are in expected order and type.
 func TestDB_Consistency(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 	if err := db.Update(func(tx *bolt.Tx) error {
 		_, err := tx.CreateBucket([]byte("widgets"))
 		return err
@@ -1099,8 +1135,8 @@ func TestDBStats_Sub(t *testing.T) {
 	b.TxStats.PageCount = 10
 	b.FreePageN = 14
 	diff := b.Sub(&a)
-	if diff.TxStats.PageCount != 7 {
-		t.Fatalf("unexpected TxStats.PageCount: %d", diff.TxStats.PageCount)
+	if diff.TxStats.GetPageCount() != 7 {
+		t.Fatalf("unexpected TxStats.PageCount: %d", diff.TxStats.GetPageCount())
 	}
 
 	// free page stats are copied from the receiver and not subtracted
@@ -1111,8 +1147,7 @@ func TestDBStats_Sub(t *testing.T) {
 
 // Ensure two functions can perform updates in a single batch.
 func TestDB_Batch(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 
 	if err := db.Update(func(tx *bolt.Tx) error {
 		if _, err := tx.CreateBucket([]byte("widgets")); err != nil {
@@ -1156,8 +1191,7 @@ func TestDB_Batch(t *testing.T) {
 }
 
 func TestDB_Batch_Panic(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 
 	var sentinel int
 	var bork = &sentinel
@@ -1187,8 +1221,7 @@ func TestDB_Batch_Panic(t *testing.T) {
 }
 
 func TestDB_BatchFull(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 	if err := db.Update(func(tx *bolt.Tx) error {
 		_, err := tx.CreateBucket([]byte("widgets"))
 		return err
@@ -1246,8 +1279,7 @@ func TestDB_BatchFull(t *testing.T) {
 }
 
 func TestDB_BatchTime(t *testing.T) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(t)
 	if err := db.Update(func(tx *bolt.Tx) error {
 		_, err := tx.CreateBucket([]byte("widgets"))
 		return err
@@ -1292,9 +1324,31 @@ func TestDB_BatchTime(t *testing.T) {
 	}
 }
 
+// TestDBUnmap verifes that `dataref`, `data` and `datasz` must be reset
+// to zero values respectively after unmapping the db.
+func TestDBUnmap(t *testing.T) {
+	db := btesting.MustCreateDB(t)
+
+	require.NoError(t, db.DB.Close())
+
+	// Ignore the following error:
+	// Error: copylocks: call of reflect.ValueOf copies lock value: go.etcd.io/bbolt.DB contains sync.Once contains sync.Mutex (govet)
+	//nolint:govet
+	v := reflect.ValueOf(*db.DB)
+	dataref := v.FieldByName("dataref")
+	data := v.FieldByName("data")
+	datasz := v.FieldByName("datasz")
+	assert.True(t, dataref.IsNil())
+	assert.True(t, data.IsNil())
+	assert.True(t, datasz.IsZero())
+
+	// Set db.DB to nil to prevent MustCheck from panicking.
+	db.DB = nil
+}
+
 func ExampleDB_Update() {
 	// Open the database.
-	db, err := bolt.Open(tempfile(), 0666, nil)
+	db, err := bolt.Open(tempfile(), 0600, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1334,7 +1388,7 @@ func ExampleDB_Update() {
 
 func ExampleDB_View() {
 	// Open the database.
-	db, err := bolt.Open(tempfile(), 0666, nil)
+	db, err := bolt.Open(tempfile(), 0600, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1377,7 +1431,7 @@ func ExampleDB_View() {
 
 func ExampleDB_Begin() {
 	// Open the database.
-	db, err := bolt.Open(tempfile(), 0666, nil)
+	db, err := bolt.Open(tempfile(), 0600, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1435,8 +1489,8 @@ func ExampleDB_Begin() {
 }
 
 func BenchmarkDBBatchAutomatic(b *testing.B) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(b)
+
 	if err := db.Update(func(tx *bolt.Tx) error {
 		_, err := tx.CreateBucket([]byte("bench"))
 		return err
@@ -1480,8 +1534,7 @@ func BenchmarkDBBatchAutomatic(b *testing.B) {
 }
 
 func BenchmarkDBBatchSingle(b *testing.B) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(b)
 	if err := db.Update(func(tx *bolt.Tx) error {
 		_, err := tx.CreateBucket([]byte("bench"))
 		return err
@@ -1524,8 +1577,7 @@ func BenchmarkDBBatchSingle(b *testing.B) {
 }
 
 func BenchmarkDBBatchManual10x100(b *testing.B) {
-	db := MustOpenDB()
-	defer db.MustClose()
+	db := btesting.MustCreateDB(b)
 	if err := db.Update(func(tx *bolt.Tx) error {
 		_, err := tx.CreateBucket([]byte("bench"))
 		return err
@@ -1578,7 +1630,7 @@ func BenchmarkDBBatchManual10x100(b *testing.B) {
 	validateBatchBench(b, db)
 }
 
-func validateBatchBench(b *testing.B, db *DB) {
+func validateBatchBench(b *testing.B, db *btesting.DB) {
 	var rollback = errors.New("sentinel error to cause rollback")
 	validate := func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte("bench"))
@@ -1613,137 +1665,6 @@ func validateBatchBench(b *testing.B, db *DB) {
 	}
 }
 
-// DB is a test wrapper for bolt.DB.
-type DB struct {
-	*bolt.DB
-	f string
-	o *bolt.Options
-}
-
-// MustOpenDB returns a new, open DB at a temporary location.
-func MustOpenDB() *DB {
-	return MustOpenWithOption(nil)
-}
-
-// MustOpenDBWithOption returns a new, open DB at a temporary location with given options.
-func MustOpenWithOption(o *bolt.Options) *DB {
-	f := tempfile()
-	if o == nil {
-		o = bolt.DefaultOptions
-	}
-
-	freelistType := bolt.FreelistArrayType
-	if env := os.Getenv(bolt.TestFreelistType); env == string(bolt.FreelistMapType) {
-		freelistType = bolt.FreelistMapType
-	}
-	o.FreelistType = freelistType
-
-	db, err := bolt.Open(f, 0666, o)
-	if err != nil {
-		panic(err)
-	}
-	return &DB{
-		DB: db,
-		f:  f,
-		o:  o,
-	}
-}
-
-// Close closes the database and deletes the underlying file.
-func (db *DB) Close() error {
-	// Log statistics.
-	if *statsFlag {
-		db.PrintStats()
-	}
-
-	// Check database consistency after every test.
-	db.MustCheck()
-
-	// Close database and remove file.
-	defer os.Remove(db.Path())
-	return db.DB.Close()
-}
-
-// MustClose closes the database and deletes the underlying file. Panic on error.
-func (db *DB) MustClose() {
-	if err := db.Close(); err != nil {
-		panic(err)
-	}
-}
-
-// MustReopen reopen the database. Panic on error.
-func (db *DB) MustReopen() {
-	indb, err := bolt.Open(db.f, 0666, db.o)
-	if err != nil {
-		panic(err)
-	}
-	db.DB = indb
-}
-
-// PrintStats prints the database stats
-func (db *DB) PrintStats() {
-	var stats = db.Stats()
-	fmt.Printf("[db] %-20s %-20s %-20s\n",
-		fmt.Sprintf("pg(%d/%d)", stats.TxStats.PageCount, stats.TxStats.PageAlloc),
-		fmt.Sprintf("cur(%d)", stats.TxStats.CursorCount),
-		fmt.Sprintf("node(%d/%d)", stats.TxStats.NodeCount, stats.TxStats.NodeDeref),
-	)
-	fmt.Printf("     %-20s %-20s %-20s\n",
-		fmt.Sprintf("rebal(%d/%v)", stats.TxStats.Rebalance, truncDuration(stats.TxStats.RebalanceTime)),
-		fmt.Sprintf("spill(%d/%v)", stats.TxStats.Spill, truncDuration(stats.TxStats.SpillTime)),
-		fmt.Sprintf("w(%d/%v)", stats.TxStats.Write, truncDuration(stats.TxStats.WriteTime)),
-	)
-}
-
-// MustCheck runs a consistency check on the database and panics if any errors are found.
-func (db *DB) MustCheck() {
-	if err := db.Update(func(tx *bolt.Tx) error {
-		// Collect all the errors.
-		var errors []error
-		for err := range tx.Check() {
-			errors = append(errors, err)
-			if len(errors) > 10 {
-				break
-			}
-		}
-
-		// If errors occurred, copy the DB and print the errors.
-		if len(errors) > 0 {
-			var path = tempfile()
-			if err := tx.CopyFile(path, 0600); err != nil {
-				panic(err)
-			}
-
-			// Print errors.
-			fmt.Print("\n\n")
-			fmt.Printf("consistency check failed (%d errors)\n", len(errors))
-			for _, err := range errors {
-				fmt.Println(err)
-			}
-			fmt.Println("")
-			fmt.Println("db saved to:")
-			fmt.Println(path)
-			fmt.Print("\n\n")
-			os.Exit(-1)
-		}
-
-		return nil
-	}); err != nil && err != bolt.ErrDatabaseNotOpen {
-		panic(err)
-	}
-}
-
-// CopyTempFile copies a database to a temporary file.
-func (db *DB) CopyTempFile() {
-	path := tempfile()
-	if err := db.View(func(tx *bolt.Tx) error {
-		return tx.CopyFile(path, 0600)
-	}); err != nil {
-		panic(err)
-	}
-	fmt.Println("db copied to: ", path)
-}
-
 // tempfile returns a temporary file path.
 func tempfile() string {
 	f, err := os.CreateTemp("", "bolt-")
@@ -1764,10 +1685,6 @@ func trunc(b []byte, length int) []byte {
 		return b[:length]
 	}
 	return b
-}
-
-func truncDuration(d time.Duration) string {
-	return regexp.MustCompile(`^(\d+)(\.\d+)`).ReplaceAllString(d.String(), "$1")
 }
 
 func fileSize(path string) int64 {
